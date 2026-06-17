@@ -1,204 +1,4 @@
-"""
-IoT Weather Station — Self-hosted backend
-Receives sensor data from NodeMCU via HTTP POST, stores in SQLite,
-serves a live dashboard and REST API.
-
-Run:  uvicorn server:app --host 0.0.0.0 --port 8000
-"""
-
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
-import sqlite3, time, os, json
-from datetime import datetime, timedelta
-from pathlib import Path
-
-# ── Config ────────────────────────────────────────────────────
-DB_PATH   = "weather.db"
-API_KEY   = os.getenv("IOT_API_KEY", "vu-iot-2026")   # set env var in production
-MAX_ROWS  = 50_000                                      # auto-trim oldest rows beyond this
-
-app = FastAPI(title="IoT Weather Station", version="1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-# ── Database ──────────────────────────────────────────────────
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    with get_db() as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS readings (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts         INTEGER NOT NULL,          -- unix timestamp (seconds)
-                temp       REAL,                      -- °C
-                humidity   REAL,                      -- %
-                pressure   REAL,                      -- hPa
-                altitude   REAL,                      -- meters
-                dew_point  REAL,                      -- °C
-                abs_hum    REAL,                      -- g/m³
-                risk       INTEGER                    -- 0–5 moisture risk
-            )
-        """)
-        db.execute("CREATE INDEX IF NOT EXISTS idx_ts ON readings(ts)")
-        # Migration: add altitude column if the table already existed
-        # without it (e.g. deployed before this field was added).
-        cols = [r[1] for r in db.execute("PRAGMA table_info(readings)").fetchall()]
-        if "altitude" not in cols:
-            db.execute("ALTER TABLE readings ADD COLUMN altitude REAL")
-            print("[MIGRATION] Added 'altitude' column to existing readings table")
-        db.commit()
-
-init_db()
-
-# ── Incoming data model ───────────────────────────────────────
-class SensorReading(BaseModel):
-    api_key:   str
-    temp:      Optional[float] = None
-    humidity:  Optional[float] = None
-    pressure:  Optional[float] = None
-    altitude:  Optional[float] = None
-    dew_point: Optional[float] = None
-    abs_hum:   Optional[float] = None
-    risk:      Optional[int]   = None
-
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import PlainTextResponse
-
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    # Log full details server-side so the real cause is visible in Render logs,
-    # instead of just "400 Bad Request" with no context.
-    body = await request.body()
-    print(f"[VALIDATION ERROR] body={body!r}  errors={exc.errors()}")
-    return PlainTextResponse(str(exc), status_code=422)
-
-# ── POST /data — receive from NodeMCU ────────────────────────
-@app.post("/data")
-async def receive_data(reading: SensorReading):
-    if reading.api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-    ts = int(time.time())
-    with get_db() as db:
-        db.execute("""
-            INSERT INTO readings (ts, temp, humidity, pressure, altitude, dew_point, abs_hum, risk)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (ts, reading.temp, reading.humidity, reading.pressure, reading.altitude,
-              reading.dew_point, reading.abs_hum, reading.risk))
-        db.commit()
-        # Auto-trim if over limit
-        count = db.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
-        if count > MAX_ROWS:
-            db.execute("""
-                DELETE FROM readings WHERE id IN (
-                    SELECT id FROM readings ORDER BY ts ASC LIMIT ?
-                )
-            """, (count - MAX_ROWS,))
-            db.commit()
-
-    return {"ok": True, "ts": ts}
-
-# ── GET /api/latest — most recent reading ────────────────────
-@app.get("/api/latest")
-def api_latest():
-    db = get_db()
-    row = db.execute('SELECT * FROM readings ORDER BY ts DESC LIMIT 1').fetchone()
-    if not row:
-        return {}
-    res = dict(row)
-    three_hours_ago = res['ts'] - 3 * 3600
-    old_row = db.execute('SELECT pressure FROM readings WHERE ts >= ? ORDER BY ts ASC LIMIT 1', (three_hours_ago,)).fetchone()
-    if old_row and old_row['pressure'] and res.get('pressure'):
-        trend = res['pressure'] - old_row['pressure']
-        res['pressureTrendHpa'] = trend
-        if trend <= -1.6:
-            res['forecastText'] = 'Rain likely soon'
-            res['forecastTextVi'] = 'Sắp có mưa rào'
-        elif trend <= -0.5:
-            res['forecastText'] = 'Clouding over'
-            res['forecastTextVi'] = 'Nhiều mây hơn'
-        elif trend < 0.5:
-            res['forecastText'] = 'No change'
-            res['forecastTextVi'] = 'Trời ổn định'
-        elif trend < 1.6:
-            res['forecastText'] = 'Improving'
-            res['forecastTextVi'] = 'Quang đãng hơn'
-        else:
-            res['forecastText'] = 'Clear skies ahead'
-            res['forecastTextVi'] = 'Trời quang mây tạnh'
-    else:
-        res['pressureTrendHpa'] = 0
-        res['forecastText'] = 'Collecting data...'
-        res['forecastTextVi'] = 'Đang thu thập...'
-    return res
-@app.get("/api/history")
-def api_history(hours: int = 24, limit: int = 500):
-    since = int(time.time()) - hours * 3600
-    rows = get_db().execute("""
-        SELECT ts, temp, humidity, pressure, altitude, dew_point, abs_hum, risk
-        FROM readings
-        WHERE ts >= ?
-        ORDER BY ts ASC
-        LIMIT ?
-    """, (since, limit)).fetchall()
-    return [dict(r) for r in rows]
-
-# ── GET /api/stats — daily stats ─────────────────────────────
-@app.get("/api/stats")
-def api_stats():
-    today_start = int(datetime.now().replace(hour=0,minute=0,second=0).timestamp())
-    week_start  = int((datetime.now() - timedelta(days=7)).timestamp())
-    db = get_db()
-
-    def stats_query(since):
-        return db.execute("""
-            SELECT
-                ROUND(MIN(temp),1)      AS temp_min,
-                ROUND(MAX(temp),1)      AS temp_max,
-                ROUND(AVG(temp),1)      AS temp_avg,
-                ROUND(MIN(humidity),1)  AS hum_min,
-                ROUND(MAX(humidity),1)  AS hum_max,
-                ROUND(AVG(humidity),1)  AS hum_avg,
-                ROUND(MIN(pressure),0)  AS press_min,
-                ROUND(MAX(pressure),0)  AS press_max,
-                ROUND(AVG(pressure),0)  AS press_avg,
-                ROUND(MAX(risk),0)      AS risk_max,
-                COUNT(*)                AS count
-            FROM readings WHERE ts >= ?
-        """, (since,)).fetchone()
-
-    today = stats_query(today_start)
-    week  = stats_query(week_start)
-    return {
-        "today": dict(today) if today else {},
-        "week":  dict(week)  if week  else {},
-    }
-
-# ── GET /api/risk_history — moisture risk events ──────────────
-@app.get("/api/risk_history")
-def api_risk_history(hours: int = 24):
-    since = int(time.time()) - hours * 3600
-    rows = get_db().execute("""
-        SELECT ts, risk, dew_point, abs_hum, humidity
-        FROM readings
-        WHERE ts >= ? AND risk >= 2
-        ORDER BY ts DESC
-        LIMIT 200
-    """, (since,)).fetchall()
-    return [dict(r) for r in rows]
-
-# ── GET / — serve the dashboard HTML ─────────────────────────
-@app.get("/", response_class=HTMLResponse)
-def dashboard():
-    return HTMLResponse(DASHBOARD_HTML)
-
-# ── Dashboard HTML (self-contained, no CDN required) ─────────
-DASHBOARD_HTML = r"""<!DOCTYPE html>
+new_html = r'''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -569,7 +369,7 @@ async function fetchLatest() {
     }
     
     const ago = Math.round((Date.now()/1000 - d.ts));
-    document.getElementById('lastUpdate').textContent = `Updated: ${ago}s ago`;
+    document.getElementById('lastUpdate').textContent = \`Updated: \${ago}s ago\`;
     const dot = document.getElementById('dot');
     if (ago < 30) { dot.style.background = 'var(--green)'; dot.style.boxShadow = '0 0 10px var(--green)'; } 
     else { dot.style.background = 'var(--orange)'; dot.style.boxShadow = '0 0 10px var(--orange)'; }
@@ -581,7 +381,7 @@ async function fetchLatest() {
 
 async function fetchHistory() {
   const limit = currentHours <= 6 ? 500 : 1000;
-  const data = await fetch(`/api/history?hours=${currentHours}&limit=${limit}`).then(r=>r.json());
+  const data = await fetch(\`/api/history?hours=\${currentHours}&limit=\${limit}\`).then(r=>r.json());
   if (!data.length) return;
   const fmt = ts => {
     const d = new Date(ts*1000);
@@ -601,14 +401,14 @@ async function fetchHistory() {
 function renderStatsUI(s) {
   const l = LANG[currentLang];
   const render = (el, st) => {
-    if (!st || !st.count) { document.getElementById(el).innerHTML=`<div style="color:var(--text-muted); padding:1rem 0;">${l.no_data}</div>`; return; }
-    document.getElementById(el).innerHTML = `
-      <div class="stat-row"><span class="stat-key">${l.stat_t}</span><span class="stat-val">${st.temp_min} / ${st.temp_max} / <span style="color:var(--accent)">${st.temp_avg} °C</span></span></div>
-      <div class="stat-row"><span class="stat-key">${l.stat_h}</span><span class="stat-val">${st.hum_min} / ${st.hum_max} / <span style="color:var(--accent)">${st.hum_avg} %</span></span></div>
-      <div class="stat-row"><span class="stat-key">${l.stat_p}</span><span class="stat-val">${st.press_min} / ${st.press_max} / <span style="color:var(--accent)">${st.press_avg} hPa</span></span></div>
-      <div class="stat-row"><span class="stat-key">${l.stat_r}</span><span class="stat-val" style="color:${RISK_COLORS[st.risk_max||0]}">${l['risk'+(st.risk_max||0)]}</span></div>
-      <div class="stat-row"><span class="stat-key">${l.stat_c}</span><span class="stat-val">${st.count.toLocaleString()}</span></div>
-    `;
+    if (!st || !st.count) { document.getElementById(el).innerHTML=\`<div style="color:var(--text-muted); padding:1rem 0;">\${l.no_data}</div>\`; return; }
+    document.getElementById(el).innerHTML = \`
+      <div class="stat-row"><span class="stat-key">\${l.stat_t}</span><span class="stat-val">\${st.temp_min} / \${st.temp_max} / <span style="color:var(--accent)">\${st.temp_avg} °C</span></span></div>
+      <div class="stat-row"><span class="stat-key">\${l.stat_h}</span><span class="stat-val">\${st.hum_min} / \${st.hum_max} / <span style="color:var(--accent)">\${st.hum_avg} %</span></span></div>
+      <div class="stat-row"><span class="stat-key">\${l.stat_p}</span><span class="stat-val">\${st.press_min} / \${st.press_max} / <span style="color:var(--accent)">\${st.press_avg} hPa</span></span></div>
+      <div class="stat-row"><span class="stat-key">\${l.stat_r}</span><span class="stat-val" style="color:\${RISK_COLORS[st.risk_max||0]}">\${l['risk'+(st.risk_max||0)]}</span></div>
+      <div class="stat-row"><span class="stat-key">\${l.stat_c}</span><span class="stat-val">\${st.count.toLocaleString()}</span></div>
+    \`;
   };
   render('statsToday', s.today);
   render('statsWeek',  s.week);
@@ -634,4 +434,61 @@ setInterval(fetchStats, 60000);
 </script>
 </body>
 </html>
-"""
+'''
+
+with open('server.py', 'r', encoding='utf-8') as f:
+    lines = f.readlines()
+
+new_lines = []
+in_api_latest = False
+for line in lines:
+    if line.startswith('@app.get("/api/latest")'):
+        in_api_latest = True
+        new_lines.append(line)
+        new_lines.append("def api_latest():\n")
+        new_lines.append("    db = get_db()\n")
+        new_lines.append("    row = db.execute('SELECT * FROM readings ORDER BY ts DESC LIMIT 1').fetchone()\n")
+        new_lines.append("    if not row:\n")
+        new_lines.append("        return {}\n")
+        new_lines.append("    res = dict(row)\n")
+        new_lines.append("    three_hours_ago = res['ts'] - 3 * 3600\n")
+        new_lines.append("    old_row = db.execute('SELECT pressure FROM readings WHERE ts >= ? ORDER BY ts ASC LIMIT 1', (three_hours_ago,)).fetchone()\n")
+        new_lines.append("    if old_row and old_row['pressure'] and res.get('pressure'):\n")
+        new_lines.append("        trend = res['pressure'] - old_row['pressure']\n")
+        new_lines.append("        res['pressureTrendHpa'] = trend\n")
+        new_lines.append("        if trend <= -1.6:\n")
+        new_lines.append("            res['forecastText'] = 'Rain likely soon'\n")
+        new_lines.append("            res['forecastTextVi'] = 'Sắp có mưa rào'\n")
+        new_lines.append("        elif trend <= -0.5:\n")
+        new_lines.append("            res['forecastText'] = 'Clouding over'\n")
+        new_lines.append("            res['forecastTextVi'] = 'Nhiều mây hơn'\n")
+        new_lines.append("        elif trend < 0.5:\n")
+        new_lines.append("            res['forecastText'] = 'No change'\n")
+        new_lines.append("            res['forecastTextVi'] = 'Trời ổn định'\n")
+        new_lines.append("        elif trend < 1.6:\n")
+        new_lines.append("            res['forecastText'] = 'Improving'\n")
+        new_lines.append("            res['forecastTextVi'] = 'Quang đãng hơn'\n")
+        new_lines.append("        else:\n")
+        new_lines.append("            res['forecastText'] = 'Clear skies ahead'\n")
+        new_lines.append("            res['forecastTextVi'] = 'Trời quang mây tạnh'\n")
+        new_lines.append("    else:\n")
+        new_lines.append("        res['pressureTrendHpa'] = 0\n")
+        new_lines.append("        res['forecastText'] = 'Collecting data...'\n")
+        new_lines.append("        res['forecastTextVi'] = 'Đang thu thập...'\n")
+        new_lines.append("    return res\n")
+        continue
+    
+    if in_api_latest:
+        if line.startswith('@app.get("/api/history")'):
+            in_api_latest = False
+            new_lines.append(line)
+        else:
+            continue
+    elif line.startswith('DASHBOARD_HTML = '):
+        new_lines.append('DASHBOARD_HTML = r"""' + new_html + '"""\n')
+        break
+    else:
+        new_lines.append(line)
+
+with open('server.py', 'w', encoding='utf-8') as f:
+    f.writelines(new_lines)
