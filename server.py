@@ -38,12 +38,19 @@ def init_db():
                 temp       REAL,                      -- °C
                 humidity   REAL,                      -- %
                 pressure   REAL,                      -- hPa
+                altitude   REAL,                      -- meters
                 dew_point  REAL,                      -- °C
                 abs_hum    REAL,                      -- g/m³
                 risk       INTEGER                    -- 0–5 moisture risk
             )
         """)
         db.execute("CREATE INDEX IF NOT EXISTS idx_ts ON readings(ts)")
+        # Migration: add altitude column if the table already existed
+        # without it (e.g. deployed before this field was added).
+        cols = [r[1] for r in db.execute("PRAGMA table_info(readings)").fetchall()]
+        if "altitude" not in cols:
+            db.execute("ALTER TABLE readings ADD COLUMN altitude REAL")
+            print("[MIGRATION] Added 'altitude' column to existing readings table")
         db.commit()
 
 init_db()
@@ -54,9 +61,21 @@ class SensorReading(BaseModel):
     temp:      Optional[float] = None
     humidity:  Optional[float] = None
     pressure:  Optional[float] = None
+    altitude:  Optional[float] = None
     dew_point: Optional[float] = None
     abs_hum:   Optional[float] = None
     risk:      Optional[int]   = None
+
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import PlainTextResponse
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # Log full details server-side so the real cause is visible in Render logs,
+    # instead of just "400 Bad Request" with no context.
+    body = await request.body()
+    print(f"[VALIDATION ERROR] body={body!r}  errors={exc.errors()}")
+    return PlainTextResponse(str(exc), status_code=422)
 
 # ── POST /data — receive from NodeMCU ────────────────────────
 @app.post("/data")
@@ -67,9 +86,9 @@ async def receive_data(reading: SensorReading):
     ts = int(time.time())
     with get_db() as db:
         db.execute("""
-            INSERT INTO readings (ts, temp, humidity, pressure, dew_point, abs_hum, risk)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (ts, reading.temp, reading.humidity, reading.pressure,
+            INSERT INTO readings (ts, temp, humidity, pressure, altitude, dew_point, abs_hum, risk)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ts, reading.temp, reading.humidity, reading.pressure, reading.altitude,
               reading.dew_point, reading.abs_hum, reading.risk))
         db.commit()
         # Auto-trim if over limit
@@ -99,7 +118,7 @@ def api_latest():
 def api_history(hours: int = 24, limit: int = 500):
     since = int(time.time()) - hours * 3600
     rows = get_db().execute("""
-        SELECT ts, temp, humidity, pressure, dew_point, abs_hum, risk
+        SELECT ts, temp, humidity, pressure, altitude, dew_point, abs_hum, risk
         FROM readings
         WHERE ts >= ?
         ORDER BY ts ASC
@@ -395,4 +414,3 @@ setInterval(fetchStats, 60000);
 </body>
 </html>
 """
-
